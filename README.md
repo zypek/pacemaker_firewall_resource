@@ -1,0 +1,1 @@
+# pacemaker_firewall_resource

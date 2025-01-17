@@ -1,0 +1,238 @@
+#!/bin/bash
+#
+# OCF Resource Agent for managing firewall rules with iptables/nftables
+#
+# Author: Sebastian Baszczyj
+# License: GNU GPLv2 or later
+
+: ${OCF_FUNCTIONS_DIR=/usr/lib/ocf/lib/heartbeat}
+
+# Source the OCF functions
+if [ -f "${OCF_FUNCTIONS_DIR}/ocf-shellfuncs" ]; then
+    . "${OCF_FUNCTIONS_DIR}/ocf-shellfuncs"
+else
+    echo "Cannot find ocf-shellfuncs at ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs"
+    exit 1
+fi
+
+export LC_ALL=en_US.UTF-8
+export LANG=en_US.UTF-8
+
+RESOURCE_NAME="firewall"
+FIREWALL_TOOL=""
+
+# Detect the available firewall tool
+
+detect_firewall_tool() {
+    # Check for nftables first and default to it if available
+    if command -v nft &>/dev/null; then
+        FIREWALL_TOOL="nft"
+        ocf_log info "Detected nftables. Defaulting to nft."
+    elif command -v iptables &>/dev/null; then
+        FIREWALL_TOOL="iptables"
+        ocf_log info "Detected iptables. Using iptables."
+    else
+        ocf_log err "Neither nftables nor iptables is available on this system"
+        return $OCF_ERR_GENERIC
+    fi
+}
+
+
+# Start the firewall rules
+start() {
+    ocf_log info "Starting firewall resource"
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+    configure_rules || return $OCF_ERR_GENERIC
+    ocf_log info "Firewall resource started successfully"
+    return $OCF_SUCCESS
+}
+
+# Stop the firewall rules
+stop() {
+    ocf_log info "Stopping firewall resource"
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+    remove_rules || return $OCF_ERR_GENERIC
+    ocf_log info "Firewall resource stopped successfully"
+    return $OCF_SUCCESS
+}
+
+# Monitor the firewall rules
+monitor() {
+    ocf_log debug "Firewall tool being used: $FIREWALL_TOOL"
+
+    # Validate if nftables or iptables is being used
+    if [ -z "$FIREWALL_TOOL" ]; then
+        detect_firewall_tool || return $OCF_ERR_GENERIC
+    fi
+
+    if [ "$FIREWALL_TOOL" == "nft" ]; then
+        # Check if the nftables table exists
+        if ! nft list table inet "$RESOURCE_NAME" &>/dev/null; then
+            ocf_log err "nftables table $RESOURCE_NAME does not exist"
+            return $OCF_NOT_RUNNING
+        fi
+
+        # Check if the expected rules are present in nftables
+        local expected_ports
+        expected_ports=$(echo "$OCF_RESKEY_ports" | tr ',' ' ')
+        for port in $expected_ports; do
+            if ! nft list ruleset | grep -q "tcp dport $port reject"; then
+                ocf_log err "Firewall rule for port $port is missing in nftables"
+                return $OCF_NOT_RUNNING
+            fi
+        done
+    elif [ "$FIREWALL_TOOL" == "iptables" ]; then
+        # Check if iptables rules are present
+        local expected_ports
+        expected_ports=$(echo "$OCF_RESKEY_ports" | tr ',' ' ')
+        for port in $expected_ports; do
+            if ! iptables -C INPUT -p tcp --dport "$port" -j REJECT &>/dev/null; then
+                ocf_log err "Firewall rule for port $port is missing in iptables"
+                return $OCF_NOT_RUNNING
+            fi
+        done
+    else
+        ocf_log err "Unknown firewall tool detected: $FIREWALL_TOOL"
+        return $OCF_ERR_GENERIC
+    fi
+
+    ocf_log info "Firewall rules are present and active"
+    return $OCF_SUCCESS
+}
+
+
+# Validate the resource configuration
+validate_all() {
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+
+    if [ -z "$OCF_RESKEY_ports" ]; then
+        ocf_exit_reason "The ports parameter is required."
+        return $OCF_ERR_CONFIGURED
+    fi
+
+    return $OCF_SUCCESS
+}
+
+# Provide metadata about the resource
+meta_data() {
+    cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="firewall" version="1.0">
+    <version>1.0</version>
+    <longdesc lang="en">
+        Manages firewall rules using either nftables or iptables. Blocks or rejects
+        a set of specified TCP ports or source IP addresses.
+    </longdesc>
+    <shortdesc lang="en">Firewall resource agent</shortdesc>
+
+    <parameters>
+        <parameter name="ports" unique="0" required="1">
+            <longdesc lang="en">
+                Comma-separated list of TCP ports to reject.
+            </longdesc>
+            <shortdesc lang="en">Ports to reject</shortdesc>
+        </parameter>
+        <parameter name="source_ips" unique="0" required="0">
+            <longdesc lang="en">
+                Comma-separated list of source IP addresses to reject.
+            </longdesc>
+            <shortdesc lang="en">Source IP addresses to reject</shortdesc>
+        </parameter>
+        <parameter name="interface" unique="0" required="0">
+            <longdesc lang="en">
+                The network interface to which the firewall rules should apply.
+            </longdesc>
+            <shortdesc lang="en">Network interface</shortdesc>
+        </parameter>
+    </parameters>
+
+    <actions>
+        <action name="start"        timeout="20"/>
+        <action name="stop"         timeout="20"/>
+        <action name="monitor"      timeout="20" interval="10"/>
+        <action name="validate-all" timeout="20"/>
+        <action name="meta-data"    timeout="5"/>
+    </actions>
+</resource-agent>
+END
+}
+
+# Configure firewall rules
+configure_rules() {
+    local ports="$OCF_RESKEY_ports"
+    local interface="$OCF_RESKEY_interface"
+    local source_ips="$OCF_RESKEY_source_ips"
+
+    if [ -z "$ports" ]; then
+        ocf_exit_reason "Ports must be specified."
+        return $OCF_ERR_CONFIGURED
+    fi
+
+    if [ "$FIREWALL_TOOL" == "nft" ]; then
+        nft add table inet $RESOURCE_NAME || return $OCF_ERR_GENERIC
+        nft add chain inet $RESOURCE_NAME input { type filter hook input priority 0\; } || return $OCF_ERR_GENERIC
+
+        for port in $(echo "$ports" | tr ',' ' '); do
+            nft add rule inet $RESOURCE_NAME input tcp dport $port reject || return $OCF_ERR_GENERIC
+        done
+
+        for ip in $(echo "$source_ips" | tr ',' ' '); do
+            nft add rule inet $RESOURCE_NAME input ip saddr $ip reject || return $OCF_ERR_GENERIC
+        done
+    else
+        for port in $(echo "$ports" | tr ',' ' '); do
+            iptables -I INPUT -p tcp --dport $port -j REJECT || return $OCF_ERR_GENERIC
+        done
+
+        for ip in $(echo "$source_ips" | tr ',' ' '); do
+            iptables -I INPUT -s $ip -j REJECT || return $OCF_ERR_GENERIC
+        done
+    fi
+
+    ocf_log info "Firewall rules configured successfully"
+    return $OCF_SUCCESS
+}
+
+# Remove firewall rules
+remove_rules() {
+    if [ "$FIREWALL_TOOL" == "nft" ]; then
+        nft delete table inet $RESOURCE_NAME || ocf_log warn "Failed to delete nftables table"
+    else
+        for port in $(echo "$OCF_RESKEY_ports" | tr ',' ' '); do
+            iptables -D INPUT -p tcp --dport $port -j REJECT || ocf_log warn "Failed to delete iptables rule for port $port"
+        done
+
+        for ip in $(echo "$OCF_RESKEY_source_ips" | tr ',' ' '); do
+            iptables -D INPUT -s $ip -j REJECT || ocf_log warn "Failed to delete iptables rule for IP $ip"
+        done
+    fi
+
+    ocf_log info "Firewall rules removed successfully"
+    return $OCF_SUCCESS
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    monitor)
+        monitor
+        ;;
+    validate-all)
+        validate_all
+        ;;
+    meta-data)
+        meta_data
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|monitor|validate-all|meta-data}"
+        exit 1
+        ;;
+esac
+
+exit $?
+
