@@ -161,38 +161,39 @@ END
 # Configure firewall rules
 configure_rules() {
     local ports="$OCF_RESKEY_ports"
-    local interface="$OCF_RESKEY_interface"
     local source_ips="$OCF_RESKEY_source_ips"
 
-    if [ -z "$ports" ]; then
-        ocf_exit_reason "Ports must be specified."
-        return $OCF_ERR_CONFIGURED
-    fi
-
     if [ "$FIREWALL_TOOL" == "nft" ]; then
-        nft add table inet $RESOURCE_NAME || return $OCF_ERR_GENERIC
-        nft add chain inet $RESOURCE_NAME input { type filter hook input priority 0\; } || return $OCF_ERR_GENERIC
+        nft add table inet $RESOURCE_NAME 2>/dev/null || true
+        nft add chain inet $RESOURCE_NAME pacemaker_deny { type filter hook input priority 0\; } 2>/dev/null || true
 
-        for port in $(echo "$ports" | tr ',' ' '); do
-            nft add rule inet $RESOURCE_NAME input tcp dport $port reject || return $OCF_ERR_GENERIC
-        done
-
-        for ip in $(echo "$source_ips" | tr ',' ' '); do
-            nft add rule inet $RESOURCE_NAME input ip saddr $ip reject || return $OCF_ERR_GENERIC
-        done
+        if [ -n "$ports" ] && [ -n "$source_ips" ]; then
+            for ip in $(echo "$source_ips" | tr ',' ' '); do
+                for port in $(echo "$ports" | tr ',' ' '); do
+                    nft add rule inet $RESOURCE_NAME pacemaker_deny ip saddr $ip tcp dport $port reject with icmp port-unreachable || return $OCF_ERR_GENERIC
+                done
+            done
+        else
+            ocf_log warn "Both 'ports' and 'source_ips' must be defined to add nftables rules."
+            return $OCF_ERR_CONFIGURED
+        fi
     else
-        for port in $(echo "$ports" | tr ',' ' '); do
-            iptables -I INPUT -p tcp --dport $port -j REJECT || return $OCF_ERR_GENERIC
-        done
-
-        for ip in $(echo "$source_ips" | tr ',' ' '); do
-            iptables -I INPUT -s $ip -j REJECT || return $OCF_ERR_GENERIC
-        done
+        if [ -n "$ports" ] && [ -n "$source_ips" ]; then
+            for ip in $(echo "$source_ips" | tr ',' ' '); do
+                for port in $(echo "$ports" | tr ',' ' '); do
+                    iptables -I INPUT -s "$ip" -p tcp --dport "$port" -j REJECT || return $OCF_ERR_GENERIC
+                done
+            done
+        else
+            ocf_log warn "Both 'ports' and 'source_ips' must be defined to add iptables rules."
+            return $OCF_ERR_CONFIGURED
+        fi
     fi
 
-    ocf_log info "Firewall rules configured successfully"
+    ocf_log info "Firewall rules configured successfully."
     return $OCF_SUCCESS
 }
+
 
 # Remove firewall rules
 remove_rules() {
