@@ -1,0 +1,297 @@
+#!/bin/bash
+#
+# OCF Resource Agent for managing firewall rules with iptables/nftables (multi-state)
+#
+# License: GNU GPLv2 or later
+
+: ${OCF_FUNCTIONS_DIR=/usr/lib/ocf/lib/heartbeat}
+
+# Source the OCF functions
+if [ -f "${OCF_FUNCTIONS_DIR}/ocf-shellfuncs" ]; then
+    . "${OCF_FUNCTIONS_DIR}/ocf-shellfuncs"
+else
+    echo "Cannot find ocf-shellfuncs at ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs"
+    exit 1
+fi
+
+# Explicitly list all environment variables used, to make static analysis happy
+: ${OCF_RESKEY_CRM_meta_interval:=0}
+: ${OCF_RESKEY_CRM_meta_globally_unique:="false"}
+: ${OCF_RESKEY_notify_delay:=0}
+: ${OCF_RESKEY_envfile:=""}
+: ${OCF_RESKEY_state:=""}
+
+# Until we can assume the new name is available ...
+: ${OCF_RUNNING_PROMOTED:=$OCF_RUNNING_MASTER}
+
+export LC_ALL=en_US.UTF-8
+export LANG=en_US.UTF-8
+
+RESOURCE_NAME="firewall"
+FIREWALL_TOOL=""
+
+# Promotion scores
+SCORE_UNPROMOTED=5
+SCORE_PROMOTED=10
+
+# Detect the available firewall tool
+detect_firewall_tool() {
+    if command -v nft &>/dev/null; then
+        FIREWALL_TOOL="nft"
+        ocf_log info "Detected nftables. Defaulting to nft."
+    elif command -v iptables &>/dev/null; then
+        FIREWALL_TOOL="iptables"
+        ocf_log info "Detected iptables. Using iptables."
+    else
+        ocf_log err "Neither nftables nor iptables is available"
+        return $OCF_ERR_GENERIC
+    fi
+}
+
+# Update state file
+stateful_update() {
+    echo "$1" > "${OCF_RESKEY_state}"
+}
+
+# Set promotion score
+set_promotion_score() {
+    "${HA_SBIN_DIR}/crm_attribute" --promotion -v "$1"
+}
+
+# Start the firewall rules (Unpromoted state)
+
+start() {
+    ocf_log info "Starting firewall resource (Unpromoted)"
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+
+    # Apply firewall rules only on Unpromoted nodes (Slaves)
+    if [ "$OCF_RESKEY_CRM_meta_role" != "Master" ]; then
+        ocf_log info "Configuring firewall rules for Unpromoted state"
+        configure_rules || return $OCF_ERR_GENERIC
+    else
+        ocf_log info "Skipping firewall rule configuration on Master"
+    fi
+
+    stateful_update Unpromoted
+    set_promotion_score $SCORE_UNPROMOTED
+    ocf_log info "Firewall started successfully (Unpromoted)"
+    return $OCF_SUCCESS
+}
+
+
+# Stop the firewall rules
+stop() {
+    ocf_log info "Stopping firewall resource"
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+    remove_rules || return $OCF_ERR_GENERIC
+    [ -f "${OCF_RESKEY_state}" ] && rm "${OCF_RESKEY_state}"
+    "${HA_SBIN_DIR}/crm_attribute" --promotion -D
+    ocf_log info "Firewall stopped successfully"
+    return $OCF_SUCCESS
+}
+
+# Promote to active state (rules removed)
+promote() {
+    ocf_log info "Promoting firewall resource"
+
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+
+    # Remove firewall rules when becoming Master
+    remove_rules || return $OCF_ERR_GENERIC
+
+    stateful_update Promoted
+    set_promotion_score $SCORE_PROMOTED
+    ocf_log info "Firewall promoted successfully (Master)"
+    return $OCF_SUCCESS
+}
+
+
+# Demote to inactive state (rules applied)
+demote() {
+    ocf_log info "Demoting firewall resource"
+
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+
+    # Apply firewall rules when demoted back to Unpromoted
+    configure_rules || return $OCF_ERR_GENERIC
+
+    stateful_update Unpromoted
+    set_promotion_score $SCORE_UNPROMOTED
+    ocf_log info "Firewall demoted successfully (now Unpromoted)"
+    return $OCF_SUCCESS
+}
+
+
+# Monitor firewall state
+monitor() {
+    local current_state="Unpromoted"
+    [ -f "${OCF_RESKEY_state}" ] && current_state=$(cat "${OCF_RESKEY_state}")
+
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+
+    if [ "$OCF_RESKEY_CRM_meta_role" = "Master" ]; then
+        # Ensure Master has no firewall rules applied
+        if [ "$FIREWALL_TOOL" = "nft" ]; then
+            nft list table inet "$RESOURCE_NAME" &>/dev/null && return $OCF_NOT_RUNNING
+        else
+            for port in $(echo "$OCF_RESKEY_ports" | tr ',' ' '); do
+                iptables -C INPUT -p tcp --dport "$port" -j REJECT &>/dev/null && return $OCF_NOT_RUNNING
+            done
+        fi
+    else
+        # Ensure Slaves have firewall rules
+        if [ "$FIREWALL_TOOL" = "nft" ]; then
+            nft list table inet "$RESOURCE_NAME" &>/dev/null || return $OCF_NOT_RUNNING
+            for port in $(echo "$OCF_RESKEY_ports" | tr ',' ' '); do
+                nft list ruleset | grep -q "tcp dport $port reject" || return $OCF_NOT_RUNNING
+            done
+        else
+            for port in $(echo "$OCF_RESKEY_ports" | tr ',' ' '); do
+                iptables -C INPUT -p tcp --dport "$port" -j REJECT &>/dev/null || return $OCF_NOT_RUNNING
+            done
+        fi
+    fi
+
+    return $OCF_SUCCESS
+}
+
+
+
+# Configure firewall rules (Unpromoted state)
+configure_rules() {
+    local ports="$OCF_RESKEY_ports"
+    local source_ips="$OCF_RESKEY_source_ips"
+
+    if [ "$OCF_RESKEY_CRM_meta_role" = "Master" ]; then
+        ocf_log info "Skipping rule configuration on Master"
+        return $OCF_SUCCESS
+    fi
+
+    if [ "$FIREWALL_TOOL" == "nft" ]; then
+        nft add table inet $RESOURCE_NAME 2>/dev/null || true
+        nft add chain inet $RESOURCE_NAME pacemaker_deny { type filter hook input priority 0\; } 2>/dev/null || true
+
+        if [ -n "$ports" ] && [ -n "$source_ips" ]; then
+            for ip in $(echo "$source_ips" | tr ',' ' '); do
+                for port in $(echo "$ports" | tr ',' ' '); do
+                    nft add rule inet $RESOURCE_NAME pacemaker_deny ip saddr $ip tcp dport $port reject with icmp port-unreachable || return $OCF_ERR_GENERIC
+                done
+            done
+        else
+            ocf_log warn "Both 'ports' and 'source_ips' must be defined to add nftables rules."
+            return $OCF_ERR_CONFIGURED
+        fi
+    else
+        if [ -n "$ports" ] && [ -n "$source_ips" ]; then
+            for ip in $(echo "$source_ips" | tr ',' ' '); do
+                for port in $(echo "$ports" | tr ',' ' '); do
+                    iptables -I INPUT -s "$ip" -p tcp --dport "$port" -j REJECT || return $OCF_ERR_GENERIC
+                done
+            done
+        else
+            ocf_log warn "Both 'ports' and 'source_ips' must be defined to add iptables rules."
+            return $OCF_ERR_CONFIGURED
+        fi
+    fi
+
+    ocf_log info "Firewall rules configured successfully."
+    return $OCF_SUCCESS
+}
+
+
+# Remove firewall rules (Promoted state)
+remove_rules() {
+    if [ "$FIREWALL_TOOL" == "nft" ]; then
+        nft delete table inet $RESOURCE_NAME || ocf_log warn "Failed to delete nftables table"
+    else
+        for port in $(echo "$OCF_RESKEY_ports" | tr ',' ' '); do
+            iptables -D INPUT -p tcp --dport $port -j REJECT || ocf_log warn "Failed to delete iptables rule for port $port"
+        done
+
+        for ip in $(echo "$OCF_RESKEY_source_ips" | tr ',' ' '); do
+            iptables -D INPUT -s $ip -j REJECT || ocf_log warn "Failed to delete iptables rule for IP $ip"
+        done
+    fi
+
+    ocf_log info "Firewall rules removed successfully"
+    return $OCF_SUCCESS
+}
+
+# Validate configuration
+validate_all() {
+    [ -z "$OCF_RESKEY_ports" ] && { ocf_log err "'ports' parameter required"; return $OCF_ERR_CONFIGURED; }
+    [ -z "$OCF_RESKEY_source_ips" ] && { ocf_log err "'source_ips' parameter required"; return $OCF_ERR_CONFIGURED; }
+    return $OCF_SUCCESS
+}
+
+# Metadata with multi-state support
+meta_data() {
+    cat <<END
+<?xml version="1.0"?>
+<!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
+<resource-agent name="firewall" version="1.1">
+    <version>1.1</version>
+    <longdesc lang="en">
+        Stateful firewall agent managing rules with iptables/nftables.
+        Unpromoted state blocks traffic, Promoted state allows it.
+    </longdesc>
+    <shortdesc lang="en">Stateful firewall agent</shortdesc>
+
+    <parameters>
+        <parameter name="state" unique-group="state">
+            <longdesc lang="en">Path to state file</longdesc>
+            <shortdesc lang="en">State file</shortdesc>
+            <content type="string" default="${HA_VARRUN}/firewall-\${OCF_RESOURCE_INSTANCE}.state"/>
+        </parameter>
+        <parameter name="ports" required="1">
+            <longdesc lang="en">Comma-separated TCP ports to block in Unpromoted state</longdesc>
+            <shortdesc lang="en">Ports to block</shortdesc>
+        </parameter>
+        <parameter name="source_ips" required="1">
+            <longdesc lang="en">Comma-separated source IPs to block</longdesc>
+            <shortdesc lang="en">Source IPs</shortdesc>
+        </parameter>
+        <parameter name="notify_delay">
+            <longdesc lang="en">Delay seconds in notify action</longdesc>
+            <shortdesc lang="en">Notify delay</shortdesc>
+            <content type="integer" default="0"/>
+        </parameter>
+    </parameters>
+
+    <actions>
+        <action name="start"        timeout="20s"/>
+        <action name="stop"         timeout="20s"/>
+        <action name="promote"      timeout="10s"/>
+        <action name="demote"       timeout="10s"/>
+        <action name="monitor"      timeout="20s" interval="10s" role="Promoted"/>
+        <action name="monitor"      timeout="20s" interval="15s" role="Unpromoted"/>
+        <action name="notify"       timeout="5s"/>
+        <action name="meta-data"    timeout="5s"/>
+        <action name="validate-all" timeout="30s"/>
+    </actions>
+</resource-agent>
+END
+}
+
+# Handle state file location
+if [ -z "$OCF_RESKEY_state" ]; then
+    if [ "${OCF_RESKEY_CRM_meta_globally_unique}" = "false" ]; then
+        OCF_RESKEY_state="${HA_VARRUN}/firewall-${OCF_RESOURCE_INSTANCE}.state"
+    else
+        OCF_RESKEY_state="${HA_VARRUN}/firewall-${OCF_RESOURCE_INSTANCE}.state"
+    fi
+fi
+
+case "$1" in
+    start|stop|promote|demote|monitor|validate-all)
+        $1 ;;
+    meta-data) meta_data;;
+    notify)
+        sleep ${OCF_RESKEY_notify_delay:-0}
+        exit $OCF_SUCCESS ;;
+    *)  echo "Usage: $0 {start|stop|promote|demote|monitor|validate-all|meta-data|notify}"
+        exit 1 ;;
+esac
+
+exit $?
+
