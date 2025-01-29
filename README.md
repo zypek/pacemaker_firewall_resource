@@ -74,4 +74,130 @@ sudo pcs resource delete firewall
 3. The `monitor` action validates that the configured rules are in place and active.
 4. On `stop`, all rules configured by the agent are removed.
 
+---------------------------------------------------------------------------------------------------------------
 
+# Firewall OCF Resource Agent
+
+A **multi-state Pacemaker resource agent** for managing firewall rules using `iptables` or `nftables`.  
+This resource agent allows a cluster to enforce different firewall rules depending on whether a node is in **Master (Promoted)** or **Slave (Unpromoted)** state.
+
+## Features
+
+✅ Supports **both `iptables` and `nftables`**  
+✅ Implements **multi-state (Master-Slave) behavior**  
+✅ **Unpromoted (Slave) nodes apply firewall rules** to block specified traffic  
+✅ **Promoted (Master) nodes remove firewall rules**, allowing unrestricted access  
+✅ **Dynamic rule management** when nodes are promoted or demoted  
+✅ **Integrated with Pacemaker clustering**  
+
+## How It Works
+
+| **Cluster Role**      | **Firewall Behavior**                         |
+|----------------------|-----------------------------------------------|
+| **Unpromoted (Slave)** | Applies firewall rules to restrict access.   |
+| **Promoted (Master)** | Removes firewall rules, allowing unrestricted access. |
+| **Demotion (Master → Slave)** | Reapplies firewall rules.   |
+| **Promotion (Slave → Master)** | Removes firewall rules.   |
+| **Monitoring** | Ensures rules are correctly applied or removed. |
+
+## Installation & Usage
+
+### 1⃣ Copy the Script to `/usr/lib/ocf/resource.d/`
+```bash
+sudo mkdir -p /usr/lib/ocf/resource.d/custom
+sudo cp firewall.sh /usr/lib/ocf/resource.d/custom/firewall
+sudo chmod +x /usr/lib/ocf/resource.d/custom/firewall
+```
+
+### 2⃣ Create the Resource in Pacemaker
+```bash
+pcs resource create firewall ocf:custom:firewall \
+    ports="80,443" source_ips="0.0.0.0/0" promotable \
+    op start timeout=20s \
+    op stop timeout=20s \
+    op monitor interval=10s on-fail=restart \
+    op monitor interval=20s role=Unpromoted on-fail=restart
+```
+
+### 3⃣ Set Migration Threshold (Optional)
+This ensures the resource **fails over after `2` failures**.
+```bash
+pcs resource meta firewall migration-threshold=2
+```
+
+### 4⃣ Check the Resource Status
+```bash
+pcs status
+```
+
+## Parameters
+
+| Parameter     | Description |
+|--------------|-------------|
+| **`ports`** | Comma-separated list of TCP ports to block when Unpromoted. |
+| **`source_ips`** | Comma-separated list of source IPs to block. |
+| **`state`** | Path to state file (used internally). |
+| **`notify_delay`** | Delay before notifying Pacemaker of a state change. |
+
+## Resource Actions
+
+| Action | Description |
+|--------|-------------|
+| **start** | Starts the firewall rules in Unpromoted mode (block traffic). |
+| **stop** | Stops the firewall rules (removes all rules). |
+| **promote** | Promotes a node to Master (removes rules). |
+| **demote** | Demotes a node to Slave (reapplies rules). |
+| **monitor** | Checks whether the rules are correctly applied. |
+| **meta-data** | Displays resource metadata. |
+
+## Monitoring & Logs
+
+### Check Resource Status
+```bash
+pcs resource show firewall
+```
+
+### Check System Logs
+```bash
+journalctl -u pacemaker --no-pager -n 50
+```
+
+### Check Pacemaker Logs
+```bash
+grep "firewall" /var/log/pacemaker.log
+```
+
+## Troubleshooting
+
+### Resource Not Starting?
+Check the logs for errors:
+```bash
+pcs resource debug-start firewall
+```
+
+### Rules Not Applied Correctly?
+Manually check the firewall rules:
+
+#### nftables
+```bash
+nft list ruleset
+```
+
+#### iptables
+```bash
+iptables -L -n -v
+```
+
+### Force Failover
+Manually move the Master node:
+```bash
+pcs resource move firewall
+```
+
+## Contributing
+
+Feel free to submit **issues or pull requests** to improve this resource agent.
+
+## License
+
+This script is licensed under the **GNU GPLv2 or later**.
