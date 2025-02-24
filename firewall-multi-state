@@ -14,43 +14,54 @@ else
     exit 1
 fi
 
-# Explicitly list all environment variables used, to make static analysis happy
+# Explicitly list all environment variables used
 : ${OCF_RESKEY_CRM_meta_interval:=0}
 : ${OCF_RESKEY_CRM_meta_globally_unique:="false"}
 : ${OCF_RESKEY_notify_delay:=0}
 : ${OCF_RESKEY_envfile:=""}
 : ${OCF_RESKEY_state:=""}
 
-# Until we can assume the new name is available ...
-: ${OCF_RUNNING_PROMOTED:=$OCF_RUNNING_MASTER}
-
 export LC_ALL=en_US.UTF-8
 export LANG=en_US.UTF-8
 
 RESOURCE_NAME="firewall"
 FIREWALL_TOOL=""
+DEDICATED_CHAIN="PACEMAKER_FW"
 
 # Promotion scores
 SCORE_UNPROMOTED=5
 SCORE_PROMOTED=10
 
-# Detect the available firewall tool
+# Validate IP/CIDR format
+validate_ip() {
+    local ip="$1"
+    if ! [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]] && ! [[ "$ip" =~ ^[a-fA-F0-9:]+(/[0-9]+)?$ ]]; then
+        ocf_log err "Invalid IP/CIDR format: $ip"
+        return 1
+    fi
+    return 0
+}
+
+# Detect firewall tool
 detect_firewall_tool() {
     if command -v nft &>/dev/null; then
         FIREWALL_TOOL="nft"
-        ocf_log info "Detected nftables. Defaulting to nft."
+        ocf_log info "Detected nftables"
     elif command -v iptables &>/dev/null; then
         FIREWALL_TOOL="iptables"
-        ocf_log info "Detected iptables. Using iptables."
+        ocf_log info "Detected iptables"
     else
-        ocf_log err "Neither nftables nor iptables is available"
+        ocf_log err "No firewall tool available"
         return $OCF_ERR_GENERIC
     fi
 }
 
-# Update state file
+# Update state file atomically
 stateful_update() {
-    echo "$1" > "${OCF_RESKEY_state}"
+    local tempfile
+    tempfile="$(mktemp "${OCF_RESKEY_state}.XXXXXX")"
+    echo "$1" > "$tempfile"
+    mv -f "$tempfile" "${OCF_RESKEY_state}"
 }
 
 # Set promotion score
@@ -58,169 +69,134 @@ set_promotion_score() {
     "${HA_SBIN_DIR}/crm_attribute" --promotion -v "$1"
 }
 
-# Start the firewall rules (Unpromoted state)
-
-start() {
-    ocf_log info "Starting firewall resource (Unpromoted)"
-    detect_firewall_tool || return $OCF_ERR_GENERIC
-
-    # Apply firewall rules only on Unpromoted nodes (Slaves)
-    if [ "$OCF_RESKEY_CRM_meta_role" != "Master" ]; then
-        ocf_log info "Configuring firewall rules for Unpromoted state"
-        configure_rules || return $OCF_ERR_GENERIC
-    else
-        ocf_log info "Skipping firewall rule configuration on Master"
-    fi
-
-    stateful_update Unpromoted
-    set_promotion_score $SCORE_UNPROMOTED
-    ocf_log info "Firewall started successfully (Unpromoted)"
-    return $OCF_SUCCESS
-}
-
-
-# Stop the firewall rules
-stop() {
-    ocf_log info "Stopping firewall resource"
-    detect_firewall_tool || return $OCF_ERR_GENERIC
-    remove_rules || return $OCF_ERR_GENERIC
-    [ -f "${OCF_RESKEY_state}" ] && rm "${OCF_RESKEY_state}"
-    "${HA_SBIN_DIR}/crm_attribute" --promotion -D
-    ocf_log info "Firewall stopped successfully"
-    return $OCF_SUCCESS
-}
-
-# Promote to active state (rules removed)
-promote() {
-    ocf_log info "Promoting firewall resource"
-
-    detect_firewall_tool || return $OCF_ERR_GENERIC
-
-    # Remove firewall rules when becoming Master
-    remove_rules || return $OCF_ERR_GENERIC
-
-    stateful_update Promoted
-    set_promotion_score $SCORE_PROMOTED
-    ocf_log info "Firewall promoted successfully (Master)"
-    return $OCF_SUCCESS
-}
-
-
-# Demote to inactive state (rules applied)
-demote() {
-    ocf_log info "Demoting firewall resource"
-
-    detect_firewall_tool || return $OCF_ERR_GENERIC
-
-    # Apply firewall rules when demoted back to Unpromoted
-    configure_rules || return $OCF_ERR_GENERIC
-
-    stateful_update Unpromoted
-    set_promotion_score $SCORE_UNPROMOTED
-    ocf_log info "Firewall demoted successfully (now Unpromoted)"
-    return $OCF_SUCCESS
-}
-
-
-# Monitor firewall state
-monitor() {
-    local current_state="Unpromoted"
-    [ -f "${OCF_RESKEY_state}" ] && current_state=$(cat "${OCF_RESKEY_state}")
-
-    detect_firewall_tool || return $OCF_ERR_GENERIC
-
-    if [ "$OCF_RESKEY_CRM_meta_role" = "Master" ]; then
-        # Ensure Master has no firewall rules applied
-        if [ "$FIREWALL_TOOL" = "nft" ]; then
-            nft list table inet "$RESOURCE_NAME" &>/dev/null && return $OCF_NOT_RUNNING
-        else
-            for port in $(echo "$OCF_RESKEY_ports" | tr ',' ' '); do
-                iptables -C INPUT -p tcp --dport "$port" -j REJECT &>/dev/null && return $OCF_NOT_RUNNING
-            done
-        fi
-    else
-        # Ensure Slaves have firewall rules
-        if [ "$FIREWALL_TOOL" = "nft" ]; then
-            nft list table inet "$RESOURCE_NAME" &>/dev/null || return $OCF_NOT_RUNNING
-            for port in $(echo "$OCF_RESKEY_ports" | tr ',' ' '); do
-                nft list ruleset | grep -q "tcp dport $port reject" || return $OCF_NOT_RUNNING
-            done
-        else
-            for port in $(echo "$OCF_RESKEY_ports" | tr ',' ' '); do
-                iptables -C INPUT -p tcp --dport "$port" -j REJECT &>/dev/null || return $OCF_NOT_RUNNING
-            done
-        fi
-    fi
-
-    return $OCF_SUCCESS
-}
-
-
-
-# Configure firewall rules (Unpromoted state)
+# Idempotent rule management
 configure_rules() {
     local ports="$OCF_RESKEY_ports"
     local source_ips="$OCF_RESKEY_source_ips"
 
-    if [ "$OCF_RESKEY_CRM_meta_role" = "Master" ]; then
-        ocf_log info "Skipping rule configuration on Master"
-        return $OCF_SUCCESS
-    fi
+    [ "$OCF_RESKEY_CRM_meta_role" = "Master" ] && return $OCF_SUCCESS
 
-    if [ "$FIREWALL_TOOL" == "nft" ]; then
-        nft add table inet $RESOURCE_NAME 2>/dev/null || true
-        nft add chain inet $RESOURCE_NAME pacemaker_deny { type filter hook input priority 0\; } 2>/dev/null || true
+    case "$FIREWALL_TOOL" in
+        nft)
+            nft add table inet $RESOURCE_NAME 2>/dev/null || true
+            nft add chain inet $RESOURCE_NAME $DEDICATED_CHAIN { type filter hook input priority 0\; } 2>/dev/null || true
 
-        if [ -n "$ports" ] && [ -n "$source_ips" ]; then
-            for ip in $(echo "$source_ips" | tr ',' ' '); do
-                for port in $(echo "$ports" | tr ',' ' '); do
-                    nft add rule inet $RESOURCE_NAME pacemaker_deny ip saddr $ip tcp dport $port reject with icmp port-unreachable || return $OCF_ERR_GENERIC
+            for ip in $(tr ',' ' ' <<< "$source_ips"); do
+                for port in $(tr ',' ' ' <<< "$ports"); do
+                    if ! nft list chain inet $RESOURCE_NAME $DEDICATED_CHAIN | grep -q "tcp dport $port ct state { established, related, new } reject"; then
+                        nft add rule inet $RESOURCE_NAME $DEDICATED_CHAIN ip saddr $ip tcp dport $port ct state { established, related, new } reject with tcp reset || return $OCF_ERR_GENERIC
+                    fi
                 done
             done
-        else
-            ocf_log warn "Both 'ports' and 'source_ips' must be defined to add nftables rules."
-            return $OCF_ERR_CONFIGURED
-        fi
-    else
-        if [ -n "$ports" ] && [ -n "$source_ips" ]; then
-            for ip in $(echo "$source_ips" | tr ',' ' '); do
-                for port in $(echo "$ports" | tr ',' ' '); do
-                    iptables -I INPUT -s "$ip" -p tcp --dport "$port" -j REJECT || return $OCF_ERR_GENERIC
+            ;;
+        iptables)
+            iptables -N $DEDICATED_CHAIN 2>/dev/null || true
+            iptables -C INPUT -j $DEDICATED_CHAIN 2>/dev/null || iptables -A INPUT -j $DEDICATED_CHAIN
+
+            for ip in $(tr ',' ' ' <<< "$source_ips"); do
+                for port in $(tr ',' ' ' <<< "$ports"); do
+                    if ! iptables -C $DEDICATED_CHAIN -s "$ip" -p tcp --dport "$port" -j REJECT &>/dev/null; then
+                        iptables -A $DEDICATED_CHAIN -s "$ip" -p tcp --dport "$port" -j REJECT || return $OCF_ERR_GENERIC
+                    fi
                 done
             done
-        else
-            ocf_log warn "Both 'ports' and 'source_ips' must be defined to add iptables rules."
-            return $OCF_ERR_CONFIGURED
-        fi
-    fi
-
-    ocf_log info "Firewall rules configured successfully."
+            ;;
+    esac
+    ocf_log info "Firewall rules configured"
     return $OCF_SUCCESS
 }
 
-
-# Remove firewall rules (Promoted state)
 remove_rules() {
-    if [ "$FIREWALL_TOOL" == "nft" ]; then
-        nft delete table inet $RESOURCE_NAME || ocf_log warn "Failed to delete nftables table"
-    else
-        for port in $(echo "$OCF_RESKEY_ports" | tr ',' ' '); do
-            iptables -D INPUT -p tcp --dport $port -j REJECT || ocf_log warn "Failed to delete iptables rule for port $port"
-        done
-
-        for ip in $(echo "$OCF_RESKEY_source_ips" | tr ',' ' '); do
-            iptables -D INPUT -s $ip -j REJECT || ocf_log warn "Failed to delete iptables rule for IP $ip"
-        done
-    fi
-
-    ocf_log info "Firewall rules removed successfully"
+    case "$FIREWALL_TOOL" in
+        nft)
+            nft delete table inet $RESOURCE_NAME 2>/dev/null && ocf_log info "NFTables rules removed"
+            ;;
+        iptables)
+            iptables -D INPUT -j $DEDICATED_CHAIN 2>/dev/null || true
+            iptables -F $DEDICATED_CHAIN 2>/dev/null
+            iptables -X $DEDICATED_CHAIN 2>/dev/null
+            ocf_log info "Iptables rules removed"
+            ;;
+    esac
     return $OCF_SUCCESS
 }
 
-# Validate configuration
+start() {
+    ocf_log info "Starting firewall (Unpromoted)"
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+    [ "$OCF_RESKEY_CRM_meta_role" != "Master" ] && configure_rules
+    stateful_update Unpromoted
+    set_promotion_score $SCORE_UNPROMOTED
+    return $OCF_SUCCESS
+}
+
+stop() {
+    ocf_log info "Stopping firewall"
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+    remove_rules
+    [ -f "${OCF_RESKEY_state}" ] && rm "${OCF_RESKEY_state}"
+    "${HA_SBIN_DIR}/crm_attribute" --promotion -D
+    return $OCF_SUCCESS
+}
+
+promote() {
+    ocf_log info "Promoting firewall"
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+    remove_rules
+    stateful_update Promoted
+    set_promotion_score $SCORE_PROMOTED
+    return $OCF_SUCCESS
+}
+
+demote() {
+    ocf_log info "Demoting firewall"
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+    configure_rules
+    stateful_update Unpromoted
+    set_promotion_score $SCORE_UNPROMOTED
+    return $OCF_SUCCESS
+}
+
+monitor() {
+    detect_firewall_tool || return $OCF_ERR_GENERIC
+    local expected_role="${OCF_RESKEY_CRM_meta_role:-Unpromoted}"
+
+    case "$FIREWALL_TOOL" in
+        nft)
+            if [ "$expected_role" = "Master" ]; then
+                nft list table inet $RESOURCE_NAME &>/dev/null && return $OCF_NOT_RUNNING
+            else
+                nft list table inet $RESOURCE_NAME &>/dev/null || return $OCF_NOT_RUNNING
+            fi
+            ;;
+        iptables)
+            if [ "$expected_role" = "Master" ]; then
+                iptables -nL $DEDICATED_CHAIN &>/dev/null && return $OCF_NOT_RUNNING
+            else
+                iptables -nL $DEDICATED_CHAIN &>/dev/null || return $OCF_NOT_RUNNING
+            fi
+            ;;
+    esac
+    return $OCF_SUCCESS
+}
+
 validate_all() {
-    [ -z "$OCF_RESKEY_ports" ] && { ocf_log err "'ports' parameter required"; return $OCF_ERR_CONFIGURED; }
-    [ -z "$OCF_RESKEY_source_ips" ] && { ocf_log err "'source_ips' parameter required"; return $OCF_ERR_CONFIGURED; }
+    [ -z "$OCF_RESKEY_ports" ] && { ocf_log err "'ports' required"; return $OCF_ERR_CONFIGURED; }
+    [ -z "$OCF_RESKEY_source_ips" ] && { ocf_log err "'source_ips' required"; return $OCF_ERR_CONFIGURED; }
+
+    local port
+    for port in $(tr ',' ' ' <<< "$OCF_RESKEY_ports"); do
+        [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -le 65535 ] || {
+            ocf_log err "Invalid port: $port";
+            return $OCF_ERR_CONFIGURED;
+        }
+    done
+
+    local ip
+    for ip in $(tr ',' ' ' <<< "$OCF_RESKEY_source_ips"); do
+        validate_ip "$ip" || return $OCF_ERR_CONFIGURED
+    done
+
     return $OCF_SUCCESS
 }
 
@@ -294,4 +270,3 @@ case "$1" in
 esac
 
 exit $?
-
